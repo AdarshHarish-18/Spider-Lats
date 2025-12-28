@@ -1,0 +1,38 @@
+import cv2 as cv
+import numpy as np
+
+capture = cv.VideoCapture(0)
+
+bg_subtractor = cv.createBackgroundSubtractorMOG2(history=500, varThreshold=50, detectShadows=False)
+
+for _ in range(30):
+    ret, frame = capture.read()
+    bg_subtractor.apply(frame)
+
+while True:
+    isTrue, frame = capture.read()
+
+    fg_mask = bg_subtractor.apply(frame)
+
+    _, fg_mask = cv.threshold(fg_mask, 180, 255, cv.THRESH_BINARY)
+
+    kernel = np.ones((7,7), np.uint8)
+    fg_mask = cv.dilate(fg_mask, kernel, iterations=2)
+    fg_mask = cv.morphologyEx(fg_mask, cv.MORPH_CLOSE, kernel)
+    fg_mask = cv.erode(fg_mask, kernel, iterations=1)
+
+    contours, _ = cv.findContours(fg_mask,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE)
+    contours = [c for c in contours if cv.contourArea(c) > 2000]
+    if not contours:
+        continue
+
+    obj = max(contours, key=cv.contourArea)
+    cv.drawContours(frame, [obj], -1, (0,255,0), 2)
+
+    cv.imshow("Contour", frame)
+
+    if cv.waitKey(20) & 0xFF==ord('d'):
+        break
+
+capture.release()
+cv.destroyAllWindows()
