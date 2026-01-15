@@ -1,37 +1,72 @@
 import cv2 as cv
 import numpy as np
+from collections import deque
 
 capture = cv.VideoCapture(0)
 
-bg_subtractor = cv.createBackgroundSubtractorMOG2(history=500, varThreshold=50, detectShadows=False)
+bg_subtractor = cv.createBackgroundSubtractorMOG2(
+    history=300, varThreshold=25, detectShadows=False
+)
 
+# Warm-up
 for _ in range(30):
     ret, frame = capture.read()
     bg_subtractor.apply(frame)
 
+kernel = np.ones((5, 5), np.uint8)
+trajectory = deque(maxlen=40)
+
 while True:
-    isTrue, frame = capture.read()
+    ret, frame = capture.read()
+    if not ret:
+        break
 
+    # ===== Object Isolation (PRIMARY) =====
     fg_mask = bg_subtractor.apply(frame)
+    _, fg_mask = cv.threshold(fg_mask, 200, 255, cv.THRESH_BINARY)
 
-    _, fg_mask = cv.threshold(fg_mask, 180, 255, cv.THRESH_BINARY)
-
-    kernel = np.ones((7,7), np.uint8)
-    fg_mask = cv.dilate(fg_mask, kernel, iterations=2)
-    fg_mask = cv.morphologyEx(fg_mask, cv.MORPH_CLOSE, kernel)
+    fg_mask = cv.morphologyEx(fg_mask, cv.MORPH_CLOSE, kernel, iterations=2)
     fg_mask = cv.erode(fg_mask, kernel, iterations=1)
 
-    contours, _ = cv.findContours(fg_mask,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE)
-    contours = [c for c in contours if cv.contourArea(c) > 2000]
-    if not contours:
-        continue
+    # ===== Contours =====
+    contours, _ = cv.findContours(
+        fg_mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE
+    )
+    contours = [c for c in contours if cv.contourArea(c) > 1500]
 
-    obj = max(contours, key=cv.contourArea)
-    cv.drawContours(frame, [obj], -1, (0,255,0), 2)
+    if contours:
+        obj = max(contours, key=cv.contourArea)
 
-    cv.imshow("Contour", frame)
+        # ===== Boundary refinement using Canny =====
+        gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+        edges = cv.Canny(gray, 50, 150)
+        edges = cv.morphologyEx(edges, cv.MORPH_CLOSE, kernel)
 
-    if cv.waitKey(20) & 0xFF==ord('d'):
+        # ---- Contour ----
+        cv.drawContours(frame, [obj], -1, (0, 255, 0), 2)
+
+        # ---- Bounding Box ----
+        x, y, w, h = cv.boundingRect(obj)
+        cv.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
+
+        # ---- Convex Hull ----
+        hull = cv.convexHull(obj)
+        cv.drawContours(frame, [hull], -1, (0, 0, 255), 2)
+
+        # ---- Centroid & Trajectory ----
+        M = cv.moments(obj)
+        if M["m00"] != 0:
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
+            trajectory.append((cx, cy))
+            cv.circle(frame, (cx, cy), 5, (0, 255, 255), -1)
+
+        for i in range(1, len(trajectory)):
+            cv.line(frame, trajectory[i-1], trajectory[i], (0, 255, 255), 2)
+
+    cv.imshow("Moving Object Boundary Tracker", frame)
+
+    if cv.waitKey(20) & 0xFF == ord('d'):
         break
 
 capture.release()
