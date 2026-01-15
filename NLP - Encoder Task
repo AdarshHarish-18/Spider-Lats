@@ -1,0 +1,231 @@
+import pandas as pd
+import ast
+import nltk
+import torch
+import torch.nn as nn
+import math
+from nltk.tokenize import word_tokenize
+from collections import Counter
+from torch.utils.data import Dataset, DataLoader
+
+nltk.download("punkt")
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Load data
+train_df = pd.read_csv("/kaggle/input/dailydialog-multi-turn-dialog-with-intention-and/train.csv")
+val_df   = pd.read_csv("/kaggle/input/dailydialog-multi-turn-dialog-with-intention-and/validation.csv")
+test_df  = pd.read_csv("/kaggle/input/dailydialog-multi-turn-dialog-with-intention-and/test.csv")
+
+# FIXED: Extract first label, not max
+def extract_text(dialog_cell):
+    return ast.literal_eval(dialog_cell)[0]
+
+def extract_label(cell):
+    labels = list(map(int, cell.strip("[]").split()))
+    return labels[0]  # Use first label instead of max
+
+def tokenize(text):
+    return word_tokenize(text.lower())
+
+for df in [train_df, val_df, test_df]:
+    df["text"] = df["dialog"].apply(extract_text)
+    df["emotion"] = df["emotion"].apply(extract_label)
+    df["act"] = df["act"].apply(extract_label) - 1  # Convert 1-4 to 0-3
+    df["tokens"] = df["text"].apply(tokenize)
+
+# Validate label ranges
+print(f"Emotion labels: {train_df['emotion'].min()} to {train_df['emotion'].max()}")
+print(f"Act labels: {train_df['act'].min()} to {train_df['act'].max()}")
+
+# Build vocab
+counter = Counter()
+for tokens in train_df["tokens"]:
+    counter.update(tokens)
+
+vocab = {"<pad>": 0, "<unk>": 1}
+for word in counter:
+    vocab[word] = len(vocab)
+
+vocab_size = len(vocab)
+PAD_ID = vocab["<pad>"]
+
+# Tokenize and pad
+MAX_LEN = int(train_df["tokens"].apply(len).quantile(0.95))
+
+def tokens_to_ids(tokens):
+    ids = [vocab.get(t, vocab["<unk>"]) for t in tokens]
+    if len(ids) > MAX_LEN:
+        ids = ids[:MAX_LEN]
+    return ids + [PAD_ID] * (MAX_LEN - len(ids))
+
+for df in [train_df, val_df, test_df]:
+    df["input_ids"] = df["tokens"].apply(tokens_to_ids)
+
+# Create tensors
+X_train = torch.tensor(train_df["input_ids"].tolist(), dtype=torch.long)
+y_train_emotion = torch.tensor(train_df["emotion"].tolist(), dtype=torch.long)
+y_train_act = torch.tensor(train_df["act"].tolist(), dtype=torch.long)
+
+X_val = torch.tensor(val_df["input_ids"].tolist(), dtype=torch.long)
+y_val_emotion = torch.tensor(val_df["emotion"].tolist(), dtype=torch.long)
+y_val_act = torch.tensor(val_df["act"].tolist(), dtype=torch.long)
+
+X_test = torch.tensor(test_df["input_ids"].tolist(), dtype=torch.long)
+y_test_emotion = torch.tensor(test_df["emotion"].tolist(), dtype=torch.long)
+y_test_act = torch.tensor(test_df["act"].tolist(), dtype=torch.long)
+
+# Dataset
+class DailyDialogDataset(Dataset):
+    def __init__(self, X, y_emotion, y_act):
+        self.X = X
+        self.y_emotion = y_emotion
+        self.y_act = y_act
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y_emotion[idx], self.y_act[idx]
+
+train_dataset = DailyDialogDataset(X_train, y_train_emotion, y_train_act)
+val_dataset   = DailyDialogDataset(X_val, y_val_emotion, y_val_act)
+test_dataset  = DailyDialogDataset(X_test, y_test_emotion, y_test_act)
+
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+val_loader   = DataLoader(val_dataset, batch_size=32)
+test_loader  = DataLoader(test_dataset, batch_size=32)
+
+# Model components
+class EmbeddingLayer(nn.Module):
+    def __init__(self, vocab_size, d_model, max_len):
+        super().__init__()
+        self.token_emb = nn.Embedding(vocab_size, d_model)
+        self.pos_emb = nn.Embedding(max_len, d_model)
+
+    def forward(self, x):
+        B, T = x.shape
+        pos = torch.arange(T, device=x.device).unsqueeze(0)
+        return self.token_emb(x) + self.pos_emb(pos)
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, heads):
+        super().__init__()
+        self.h = heads
+        self.dk = d_model // heads
+        self.q = nn.Linear(d_model, d_model)
+        self.k = nn.Linear(d_model, d_model)
+        self.v = nn.Linear(d_model, d_model)
+        self.o = nn.Linear(d_model, d_model)
+
+    def forward(self, x, mask):
+        B, T, D = x.shape
+        Q = self.q(x).view(B, T, self.h, self.dk).transpose(1,2)
+        K = self.k(x).view(B, T, self.h, self.dk).transpose(1,2)
+        V = self.v(x).view(B, T, self.h, self.dk).transpose(1,2)
+
+        scores = (Q @ K.transpose(-2,-1)) / math.sqrt(self.dk)
+        scores = scores.masked_fill(mask == 0, -1e9)
+        attn = torch.softmax(scores, dim=-1)
+
+        out = (attn @ V).transpose(1,2).contiguous().view(B, T, D)
+        return self.o(out)
+
+class EncoderBlock(nn.Module):
+    def __init__(self, d_model, heads, d_ff):
+        super().__init__()
+        self.attn = MultiHeadAttention(d_model, heads)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.ReLU(),
+            nn.Linear(d_ff, d_model)
+        )
+        self.n1 = nn.LayerNorm(d_model)
+        self.n2 = nn.LayerNorm(d_model)
+
+    def forward(self, x, mask):
+        x = self.n1(x + self.attn(x, mask))
+        x = self.n2(x + self.ff(x))
+        return x
+
+class TransformerMultiTask(nn.Module):
+    def __init__(self, vocab_size, max_len):
+        super(TransformerMultiTask, self).__init__()
+        self.emb = EmbeddingLayer(vocab_size, 128, max_len)
+        self.layers = nn.ModuleList([EncoderBlock(128, 8, 512) for _ in range(4)])
+        self.emotion_head = nn.Linear(128, 7)
+        self.act_head = nn.Linear(128, 4)
+
+    def forward(self, x):
+        mask = (x != PAD_ID).unsqueeze(1).unsqueeze(2)
+        x = self.emb(x)
+        for layer in self.layers:
+            x = layer(x, mask)
+        pooled = x.mean(dim=1)
+        return self.emotion_head(pooled), self.act_head(pooled)
+
+model = TransformerMultiTask(vocab_size, MAX_LEN).to(device)
+
+emotion_loss = nn.CrossEntropyLoss()
+act_loss = nn.CrossEntropyLoss()
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+def train_epoch():
+    model.train()
+    total = 0
+    for x, e, a in train_loader:
+        x, e, a = x.to(device), e.to(device), a.to(device)
+        optimizer.zero_grad()
+        e_logits, a_logits = model(x)
+        loss = emotion_loss(e_logits, e) + act_loss(a_logits, a)
+        loss.backward()
+        optimizer.step()
+        total += loss.item()
+    return total / len(train_loader)
+
+def evaluate(loader):
+    model.eval()
+    ce = ca = tot = 0
+    with torch.no_grad():
+        for x, e, a in loader:
+            x, e, a = x.to(device), e.to(device), a.to(device)
+            e_logits, a_logits = model(x)
+            ce += (e_logits.argmax(1) == e).sum().item()
+            ca += (a_logits.argmax(1) == a).sum().item()
+            tot += e.size(0)
+    return ce/tot, ca/tot
+
+# Train
+EPOCHS = 6
+for ep in range(EPOCHS):
+    loss = train_epoch()
+    emo_acc, act_acc = evaluate(test_loader)
+    print(f"Epoch {ep+1} | Loss {loss:.4f} | Emotion Acc {emo_acc:.4f} | Act Acc {act_acc:.4f}")
+
+model.eval()
+correct_emotion = 0
+correct_act = 0
+total = 0
+
+with torch.no_grad():
+    for x, e, a in test_loader:
+        x, e, a = x.to(device), e.to(device), a.to(device)
+        e_logits, a_logits = model(x)
+        
+        # Get predictions
+        e_pred = e_logits.argmax(dim=1)
+        a_pred = a_logits.argmax(dim=1)
+        
+        # Count correct predictions
+        correct_emotion += (e_pred == e).sum().item()
+        correct_act += (a_pred == a).sum().item()
+        total += e.size(0)
+
+emotion_accuracy = correct_emotion / total
+act_accuracy = correct_act / total
+
+print(f"\nTest Set Results:")
+print(f"  Emotion Recognition Accuracy: {emotion_accuracy:.4f} ({emotion_accuracy*100:.2f}%)")
+print(f"  Dialog Act Accuracy: {act_accuracy:.4f} ({act_accuracy*100:.2f}%)")
+print(f"  Total samples tested: {total}")
+print("="*50)
