@@ -1,0 +1,112 @@
+import cv2
+import mediapipe as mp
+import pyautogui
+import time
+import math
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+
+cam = cv2.VideoCapture(0)
+screen_w, screen_h = pyautogui.size()
+
+base_options = python.BaseOptions(
+    model_asset_path="face_landmarker.task"
+)
+
+options = vision.FaceLandmarkerOptions(
+    base_options=base_options,
+    num_faces=1
+)
+
+face_landmarker = vision.FaceLandmarker.create_from_options(options)
+
+# ---------------- PARAMETERS ----------------
+BLINK_THRESHOLD = 0.006
+BLINK_TIME_WINDOW = 1.2
+GAZE_HOLD_TIME = 3.0
+MOVE_SPEED = 25
+
+blink_count = 0
+last_blink_time = 0
+gaze_start_time = None
+
+pyautogui.FAILSAFE = False
+
+# ---------------- MAIN LOOP ----------------
+while True:
+    ret, frame = cam.read()
+    if not ret:
+        break
+
+    frame = cv2.flip(frame, 1)
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    h, w, _ = frame.shape
+
+    mp_image = mp.Image(
+        image_format=mp.ImageFormat.SRGB,
+        data=rgb
+    )
+
+    result = face_landmarker.detect(mp_image)
+
+    if result.face_landmarks:
+        lm = result.face_landmarks[0]
+
+        # -------- IRIS (RIGHT EYE) --------
+        iris = lm[475]
+        cx, cy = int(iris.x * w), int(iris.y * h)
+        cv2.circle(frame, (cx, cy), 4, (0, 255, 0), -1)
+
+        # -------- GAZE DIRECTION --------
+        dx = iris.x - 0.5
+        dy = iris.y - 0.5
+
+        move_x, move_y = 0, 0
+
+        if abs(dx) < 0.03 and abs(dy) < 0.03:
+            # CENTER (hold)
+            if gaze_start_time is None:
+                gaze_start_time = time.time()
+            elif time.time() - gaze_start_time > GAZE_HOLD_TIME:
+                pyautogui.click()
+                gaze_start_time = None
+        else:
+            gaze_start_time = None
+            if dx < -0.03:
+                move_x = -MOVE_SPEED
+            elif dx > 0.03:
+                move_x = MOVE_SPEED
+            if dy < -0.03:
+                move_y = -MOVE_SPEED
+            elif dy > 0.03:
+                move_y = MOVE_SPEED
+
+            pyautogui.moveRel(move_x, move_y, duration=0.01)
+
+        # -------- BLINK DETECTION --------
+        upper = lm[159]
+        lower = lm[145]
+        eye_dist = abs(upper.y - lower.y)
+        now = time.time()
+
+        if eye_dist < BLINK_THRESHOLD:
+            if now - last_blink_time > 0.25:
+                blink_count += 1
+                last_blink_time = now
+
+        # -------- BLINK ACTIONS --------
+        if now - last_blink_time > BLINK_TIME_WINDOW and blink_count > 0:
+            if blink_count == 2:
+                pyautogui.click()
+            elif blink_count == 3:
+                pyautogui.rightClick()
+            blink_count = 0
+
+    cv2.imshow("Gaze Controlled Virtual Mouse", frame)
+
+    key = cv2.waitKey(30) & 0xFF
+    if key == 27:  
+        break
+  
+cam.release()
+cv2.destroyAllWindows()
